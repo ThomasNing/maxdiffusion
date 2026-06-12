@@ -1,0 +1,26 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+run_name: 'flux2klein_test_run'
+
+# basic config for flux2klein
+flux_name: "flux2klein"
+pretrained_model_name_or_path: "black-forest-labs/FLUX.2-klein-4B"
+use_latents: True
+
+# generation settings
+height: 512
+width: 512
+batch_size: 1
+prompt: "A detailed vector illustration of a robotic hummingbird"

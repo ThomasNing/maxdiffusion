@@ -6,6 +6,14 @@ from diffusers import Flux2KleinPipeline
 # Unified dictionary to hold every diagnostic array
 saved_data = {}
 
+# Global state tracking for CFG and Multi-step
+current_step = 0
+transformer_call_count = 0
+
+def get_prefix():
+    pass_name = "cond" if transformer_call_count == 0 else "uncond"
+    return f"step_{current_step}_{pass_name}_"
+
 # ==========================================
 # 1. Load Model (Strictly CPU & Float32)
 # ==========================================
@@ -26,87 +34,132 @@ print("Registering updated hooks for FLUX.2 conditioning layouts...")
 
 # --- Target 1) Text Embeddings Sequence ---
 def hook_context_embedder(module, args, output):
-    saved_data["sequence_text_emb"] = output.detach().cpu().numpy()
+    # Only save this once (it is the same across steps, but let's save it under cond)
+    if "sequence_text_emb" not in saved_data:
+        saved_data["sequence_text_emb"] = output.detach().cpu().numpy()
 
 transformer.context_embedder.register_forward_hook(hook_context_embedder)
 
 # --- Target 2) & 3) Time/Guidance Conditioning Vector ---
-# Flux.2 replaces time_text_embed with time_guidance_embed
+# Capture this per step and pass!
 def hook_time_guidance_embed(module, args, output):
-    saved_data["joint_time_guidance_conditioning_vector_t0"] = output.detach().cpu().numpy()
+    prefix = get_prefix()
+    saved_data[f"{prefix}joint_time_guidance_conditioning_vector"] = output.detach().cpu().numpy()
 
 if hasattr(transformer, "time_guidance_embed"):
     transformer.time_guidance_embed.register_forward_hook(hook_time_guidance_embed)
     
     # Capture pure sinusoidal time embedding before guidance mix
     if hasattr(transformer.time_guidance_embed, "timestep_embedder"):
-        transformer.time_guidance_embed.timestep_embedder.register_forward_hook(
-            lambda m, inp, out: saved_data.update({"pure_time_embedding": out.detach().cpu().numpy()})
-        )
+        def hook_timestep_embedder(module, args, output):
+            prefix = get_prefix()
+            saved_data[f"{prefix}pure_time_embedding"] = output.detach().cpu().numpy()
+        transformer.time_guidance_embed.timestep_embedder.register_forward_hook(hook_timestep_embedder)
 
 # --- Target 4) Global Shift/Scale Parameter Generators ---
-# These are the global blocks generating modulation keys for the whole network
+# Capture these per step and pass!
+def make_modulation_hook(name):
+    return lambda m, inp, out: saved_data.update({f"{get_prefix()}{name}": out.detach().cpu().numpy()})
+
 if hasattr(transformer, "double_stream_modulation_img"):
     transformer.double_stream_modulation_img.register_forward_hook(
-        lambda m, inp, out: saved_data.update({"global_double_img_modulation_params": out.detach().cpu().numpy()})
+        make_modulation_hook("global_double_img_modulation_params")
     )
 if hasattr(transformer, "double_stream_modulation_txt"):
     transformer.double_stream_modulation_txt.register_forward_hook(
-        lambda m, inp, out: saved_data.update({"global_double_txt_modulation_params": out.detach().cpu().numpy()})
+        make_modulation_hook("global_double_txt_modulation_params")
     )
 if hasattr(transformer, "single_stream_modulation"):
     transformer.single_stream_modulation.register_forward_hook(
-        lambda m, inp, out: saved_data.update({"global_single_joint_modulation_params": out.detach().cpu().numpy()})
+        make_modulation_hook("global_single_joint_modulation_params")
     )
 
-# --- Target 5) Top-level Latent Entry ---
+# --- Target 5) Top-level Latent Entry & Exit ---
 def transformer_top_pre_hook(module, args, kwargs):
-    if "initial_transformer_input_latents" not in saved_data:
-        h = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
-        if h is not None:
-            saved_data["initial_transformer_input_latents"] = h.detach().cpu().numpy()
+    prefix = get_prefix()
+    h = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
+    if h is not None:
+        saved_data[f"{prefix}transformer_input_latents"] = h.detach().cpu().numpy()
+        
+    # Capture RoPE IDs once on step 0
+    if current_step == 0:
+        if "txt_ids" not in saved_data:
+            txt_ids = kwargs.get("txt_ids", args[4] if len(args) > 4 else None)
+            if txt_ids is not None:
+                saved_data["txt_ids"] = txt_ids.detach().cpu().numpy()
+        if "img_ids" not in saved_data:
+            img_ids = kwargs.get("img_ids", args[5] if len(args) > 5 else None)
+            if img_ids is not None:
+                saved_data["img_ids"] = img_ids.detach().cpu().numpy()
+
+def transformer_top_post_hook(module, args, output):
+    global transformer_call_count
+    prefix = get_prefix()
+    
+    # Capture top-level output exiting the transformer at every step
+    if isinstance(output, tuple):
+        saved_data[f"{prefix}transformer_output_latents"] = output[0].detach().cpu().numpy()
+    else:
+        saved_data[f"{prefix}transformer_output_latents"] = output.detach().cpu().numpy()
+        
+    transformer_call_count += 1
 
 transformer.register_forward_pre_hook(transformer_top_pre_hook, with_kwargs=True)
+transformer.register_forward_hook(transformer_top_post_hook)
 
 
 # ==========================================
-# 3. Register Block-by-Block Hooks (4, 5, 6)
+# 3. Register Block-by-Block Hooks (Step 0 Only!)
 # ==========================================
-print("Registering deep hooks inside individual transformer layers...")
+print("Registering deep hooks inside individual transformer layers (active on Step 0 only)...")
 
 # --- Hook Double Stream Transformer Blocks ---
 if hasattr(transformer, "transformer_blocks"):
     for i, block in enumerate(transformer.transformer_blocks):
         
-        # Capture input latents per block boundary
         def make_double_pre_hook(block_idx):
             def pre_hook(module, args, kwargs):
+                if current_step > 0:
+                    return
+                prefix = get_prefix()
                 h = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
                 ctx = kwargs.get("encoder_hidden_states", args[1] if len(args) > 1 else None)
                 if h is not None:
-                    saved_data[f"double_block_{block_idx}_input_image_latents"] = h.detach().cpu().numpy()
+                    saved_data[f"{prefix}double_block_{block_idx}_input_image_latents"] = h.detach().cpu().numpy()
                 if ctx is not None:
-                    saved_data[f"double_block_{block_idx}_input_text_latents"] = ctx.detach().cpu().numpy()
+                    saved_data[f"{prefix}double_block_{block_idx}_input_text_latents"] = ctx.detach().cpu().numpy()
             return pre_hook
         block.register_forward_pre_hook(make_double_pre_hook(i), with_kwargs=True)
 
-        # Target 6) Capture features right after scaling/shifting is applied inside norms
+        # Capture modulated activations
+        def make_double_norm1_hook(block_idx):
+            def hook(m, inp, out):
+                if current_step > 0:
+                    return
+                saved_data[f"{get_prefix()}double_block_{block_idx}_modulated_image_latents"] = out.detach().cpu().numpy()
+            return hook
         if hasattr(block, "norm1"):
-            block.norm1.register_forward_hook(
-                lambda m, inp, out, idx=i: saved_data.update({f"double_block_{idx}_modulated_image_latents": out.detach().cpu().numpy()})
-            )
+            block.norm1.register_forward_hook(make_double_norm1_hook(i))
+            
+        def make_double_norm1_context_hook(block_idx):
+            def hook(m, inp, out):
+                if current_step > 0:
+                    return
+                saved_data[f"{get_prefix()}double_block_{block_idx}_modulated_text_latents"] = out.detach().cpu().numpy()
+            return hook
         if hasattr(block, "norm1_context"):
-            block.norm1_context.register_forward_hook(
-                lambda m, inp, out, idx=i: saved_data.update({f"double_block_{idx}_modulated_text_latents": out.detach().cpu().numpy()})
-            )
+            block.norm1_context.register_forward_hook(make_double_norm1_context_hook(i))
 
-        # Capture final outputs exiting the block
+        # Capture outputs exiting the block
         def make_double_post_hook(block_idx):
             def post_hook(module, args, output):
+                if current_step > 0:
+                    return
+                prefix = get_prefix()
                 if isinstance(output, tuple):
-                    saved_data[f"double_block_{block_idx}_output_image_latents"] = output[0].detach().cpu().numpy()
+                    saved_data[f"{prefix}double_block_{block_idx}_output_image_latents"] = output[0].detach().cpu().numpy()
                     if len(output) > 1 and output[1] is not None:
-                        saved_data[f"double_block_{block_idx}_output_text_latents"] = output[1].detach().cpu().numpy()
+                        saved_data[f"{prefix}double_block_{block_idx}_output_text_latents"] = output[1].detach().cpu().numpy()
             return post_hook
         block.register_forward_hook(make_double_post_hook(i))
 
@@ -114,19 +167,33 @@ if hasattr(transformer, "transformer_blocks"):
 if hasattr(transformer, "single_transformer_blocks"):
     for i, block in enumerate(transformer.single_transformer_blocks):
         
-        block.register_forward_pre_hook(
-            lambda m, args, kwargs, idx=i: saved_data.update({f"single_block_{idx}_input_latents": (kwargs.get("hidden_states", args[0] if len(args) > 0 else None)).detach().cpu().numpy()}),
-            with_kwargs=True
-        )
-        # Target 6) Modulated joint inputs
+        def make_single_pre_hook(block_idx):
+            def pre_hook(module, args, kwargs):
+                if current_step > 0:
+                    return
+                prefix = get_prefix()
+                h = kwargs.get("hidden_states", args[0] if len(args) > 0 else None)
+                if h is not None:
+                    saved_data[f"{prefix}single_block_{block_idx}_input_latents"] = h.detach().cpu().numpy()
+            return pre_hook
+        block.register_forward_pre_hook(make_single_pre_hook(i), with_kwargs=True)
+        
+        def make_single_norm_hook(block_idx):
+            def hook(m, inp, out):
+                if current_step > 0:
+                    return
+                saved_data[f"{get_prefix()}single_block_{block_idx}_modulated_latents"] = out.detach().cpu().numpy()
+            return hook
         if hasattr(block, "norm"):
-            block.norm.register_forward_hook(
-                lambda m, inp, out, idx=i: saved_data.update({f"single_block_{idx}_modulated_latents": out.detach().cpu().numpy()})
-            )
-        # Capture outputs exiting the single block
-        block.register_forward_hook(
-            lambda m, inp, out, idx=i: saved_data.update({f"single_block_{idx}_output_latents": out.detach().cpu().numpy()})
-        )
+            block.norm.register_forward_hook(make_single_norm_hook(i))
+            
+        def make_single_post_hook(block_idx):
+            def hook(m, inp, out):
+                if current_step > 0:
+                    return
+                saved_data[f"{get_prefix()}single_block_{block_idx}_output_latents"] = out.detach().cpu().numpy()
+            return hook
+        block.register_forward_hook(make_single_post_hook(i))
 
 
 # ==========================================
@@ -153,35 +220,52 @@ if hasattr(vae, "decoder"):
 
 
 # ==========================================
-# 5. Execute Pipeline Pass
+# 5. Execute Pipeline Pass (4 Steps, CFG 4.0)
 # ==========================================
 def callback_on_step_end(pipe, step, timestep, callback_kwargs):
-    if step == 0:
-        saved_data["initial_pipeline_latents"] = callback_kwargs["latents"].detach().cpu().numpy()
+    global current_step, transformer_call_count
+    
+    # Save the updated latents exiting this step (which is the input to the next step)
+    saved_data[f"step_{step}_output_latents"] = callback_kwargs["latents"].detach().cpu().numpy()
+    saved_data[f"step_{step}_timestep"] = timestep.item()
+    
+    # Reset call count and increment step
+    transformer_call_count = 0
+    current_step += 1
+    
     return callback_kwargs
 
 prompt = "A detailed vector illustration of a robotic hummingbird"
 generator = torch.Generator(device="cpu").manual_seed(42)
 
-print("Executing single-step forward pass...")
+print("Executing 4-step forward pass with guidance_scale=4.0...")
 with torch.no_grad():
-    _ = pipe(
+    output = pipe(
         prompt=prompt,
         height=512,
         width=512,
-        num_inference_steps=1,
+        num_inference_steps=4,
         generator=generator,
-        guidance_scale=0.0,
+        guidance_scale=4.0,
         callback_on_step_end=callback_on_step_end
     )
 
 # ==========================================
-# 6. Save Bundle to Disk
+# 6. Save Visual Target Image (PNG)
 # ==========================================
-output_filename = "flux2_klein_complete_diagnostic_bundle.npz"
+if hasattr(output, "images") and len(output.images) > 0:
+    image = output.images[0]
+    target_image_path = "src/maxdiffusion/tests/flux2_klein_4step_cfg4_target.png"
+    image.save(target_image_path)
+    print(f"\nSaved visual target image to: {os.path.abspath(target_image_path)}")
+
+# ==========================================
+# 7. Save Bundle to Disk
+# ==========================================
+output_filename = "src/maxdiffusion/tests/flux2_klein_complete_diagnostic_bundle.npz"
 np.savez_compressed(output_filename, **saved_data)
 
 print(f"\n=======================================================")
-print(f"SUCCESS! Harvested {len(saved_data)} clean tracking arrays.")
+print(f"SUCCESS! Harvested {len(saved_data)} clean tracking arrays across 4 steps.")
 print(f"File Saved: {os.path.abspath(output_filename)}")
 print(f"=======================================================")
